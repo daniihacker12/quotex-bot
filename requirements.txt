@@ -1,0 +1,2 @@
+# No external packages needed - uses Python built-in libraries only
+# This file is required by Railway.app for deployment
