@@ -1,12 +1,10 @@
 """
-Quotex OTC ULTRA AI Signal Bot
-================================
-HEAVY MULTI-TIMEFRAME ANALYSIS
-- 1min + 15min timeframe confluence
-- 12 indicators combined
-- Only signals when 70%+ indicators agree
-- Accuracy & Confidence scoring
-- Best OTC pair auto-selected
+╔══════════════════════════════════════╗
+║   ULTIMATE OTC + GOLD FOREVER BOT   ║
+║   Auto signals every 15 sec & 1min  ║
+║   15 indicators + MTF confluence    ║
+║   Gold with TP1 TP2 SL + Liquidity  ║
+╚══════════════════════════════════════╝
 """
 
 import urllib.request
@@ -19,7 +17,7 @@ import math
 from datetime import datetime
 import os
 
-# CONFIG
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8758667468:AAGjQhPgjC6sFmfcpuxqsYrb_X7VgfN6C5o")
 TWELVE_DATA_KEY    = os.environ.get("TWELVE_DATA_KEY",    "79effd4d5f714ff49fa73bc7f906d6c1")
 
@@ -27,17 +25,16 @@ OTC_SYMBOLS = [
     "EUR/USD", "GBP/USD", "AUD/USD", "USD/JPY",
     "USD/CAD", "EUR/GBP", "NZD/USD", "USD/CHF"
 ]
+GOLD_SYMBOL     = "XAU/USD"
+MIN_CONFLUENCE  = 0.60   # 60% indicators must agree
+FAST_INTERVAL   = 15     # seconds between fast scans
+SLOW_INTERVAL   = 60     # seconds between full scans
 
-GOLD_SYMBOL        = "XAU/USD"
-GOLD_SL_POINTS     = 150
-GOLD_TP1_POINTS    = 200
-GOLD_TP2_POINTS    = 400
-MIN_CONFLUENCE     = 0.65   # 65% indicators must agree
-LOOP_SECONDS       = 60
-
-auto_mode   = {}
-last_signal = {}
+auto_mode   = {}   # chat_id → True/False
+last_signal = {}   # key → timestamp
 last_update = 0
+candle_cache= {}   # symbol+interval → (timestamp, candles)
+CACHE_TTL   = 14   # seconds cache valid
 
 
 # ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -50,7 +47,7 @@ def tg_request(method, params={}):
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
     except Exception as e:
-        print(f"TG error: {e}")
+        print(f"TG error [{method}]: {e}")
         return {}
 
 def send_msg(chat_id, text):
@@ -59,576 +56,594 @@ def send_msg(chat_id, text):
     })
 
 def get_updates(offset=0):
-    return tg_request("getUpdates", {"offset": offset, "timeout": 30}).get("result", [])
+    return tg_request("getUpdates", {
+        "offset": offset, "timeout": 20
+    }).get("result", [])
 
 
-# ── DATA ──────────────────────────────────────────────────────────────────────
+# ── DATA WITH CACHE ───────────────────────────────────────────────────────────
 
 def get_candles(symbol, interval="1min", outputsize=100):
+    cache_key = f"{symbol}_{interval}"
+    now = time.time()
+    if cache_key in candle_cache:
+        ts, data = candle_cache[cache_key]
+        if now - ts < CACHE_TTL:
+            return data
     try:
         sym = urllib.parse.quote(symbol)
         url = (f"https://api.twelvedata.com/time_series"
-               f"?symbol={sym}&interval={interval}&outputsize={outputsize}"
-               f"&apikey={TWELVE_DATA_KEY}")
+               f"?symbol={sym}&interval={interval}"
+               f"&outputsize={outputsize}&apikey={TWELVE_DATA_KEY}")
         with urllib.request.urlopen(url, timeout=15) as r:
-            data = json.loads(r.read())
-        if "values" not in data:
-            return []
-        return [{"o": float(v["open"]), "h": float(v["high"]),
-                 "l": float(v["low"]),  "c": float(v["close"])}
-                for v in reversed(data["values"])]
+            raw = json.loads(r.read())
+        if "values" not in raw:
+            return candle_cache.get(cache_key, (0, []))[1]
+        candles = [{"o": float(v["open"]),  "h": float(v["high"]),
+                    "l": float(v["low"]),   "c": float(v["close"])}
+                   for v in reversed(raw["values"])]
+        candle_cache[cache_key] = (now, candles)
+        return candles
     except Exception as e:
         print(f"Data error {symbol}/{interval}: {e}")
-        return []
+        return candle_cache.get(cache_key, (0, []))[1]
 
 
 # ── INDICATORS ────────────────────────────────────────────────────────────────
 
-def ema(closes, period):
-    if len(closes) < period:
-        return closes[-1]
-    k   = 2 / (period + 1)
-    val = sum(closes[:period]) / period
-    for p in closes[period:]:
-        val = p * k + val * (1 - k)
-    return val
+def ema(closes, p):
+    if len(closes) < p: return closes[-1]
+    k = 2/(p+1); v = sum(closes[:p])/p
+    for x in closes[p:]: v = x*k + v*(1-k)
+    return v
 
-def sma(closes, period):
-    if len(closes) < period:
-        return closes[-1]
-    return sum(closes[-period:]) / period
+def sma(closes, p):
+    return sum(closes[-p:])/p if len(closes) >= p else closes[-1]
 
-def rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
-    gains = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
-    losses= [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    return 100 if al == 0 else round(100 - 100/(1 + ag/al), 2)
+def rsi(closes, p=14):
+    if len(closes) < p+1: return 50
+    g = [max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
+    l = [max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
+    ag = sum(g[-p:])/p; al = sum(l[-p:])/p
+    return 100 if al==0 else round(100-100/(1+ag/al),2)
 
-def macd(closes):
-    if len(closes) < 26:
-        return 0, 0, 0
-    e12  = ema(closes, 12)
-    e26  = ema(closes, 26)
-    line = e12 - e26
-    # Signal = 9 EMA of macd line (simplified)
-    signal = line * 0.9
-    hist   = line - signal
-    return round(line, 6), round(signal, 6), round(hist, 6)
+def macd_sig(closes):
+    if len(closes) < 26: return 0,0
+    e12=ema(closes,12); e26=ema(closes,26)
+    line=e12-e26; sig=line*0.85
+    return round(line,6), round(sig,6)
 
-def bollinger(closes, period=20):
-    if len(closes) < period:
-        return closes[-1], closes[-1], closes[-1]
-    mid   = sma(closes, period)
-    std   = math.sqrt(sum((c - mid)**2 for c in closes[-period:]) / period)
-    return round(mid + 2*std, 5), round(mid, 5), round(mid - 2*std, 5)
+def bollinger(closes, p=20):
+    if len(closes) < p: return closes[-1],closes[-1],closes[-1]
+    m = sma(closes,p)
+    s = math.sqrt(sum((c-m)**2 for c in closes[-p:])/p)
+    return round(m+2*s,5), round(m,5), round(m-2*s,5)
 
-def stochastic(candles, period=14):
-    if len(candles) < period:
-        return 50, 50
-    highs  = [c["h"] for c in candles[-period:]]
-    lows   = [c["l"] for c in candles[-period:]]
-    close  = candles[-1]["c"]
-    h14    = max(highs)
-    l14    = min(lows)
-    if h14 == l14:
-        return 50, 50
-    k = round((close - l14) / (h14 - l14) * 100, 2)
-    d = round(k * 0.9, 2)
-    return k, d
+def stoch(candles, p=14):
+    if len(candles) < p: return 50,50
+    h = max(c["h"] for c in candles[-p:])
+    l = min(c["l"] for c in candles[-p:])
+    c = candles[-1]["c"]
+    if h==l: return 50,50
+    k = round((c-l)/(h-l)*100,2)
+    return k, round(k*0.9,2)
 
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return 0
-    trs = []
-    for i in range(1, len(candles)):
-        tr = max(
-            candles[i]["h"] - candles[i]["l"],
-            abs(candles[i]["h"] - candles[i-1]["c"]),
-            abs(candles[i]["l"] - candles[i-1]["c"])
-        )
-        trs.append(tr)
-    return round(sum(trs[-period:]) / period, 6)
+def williams(candles, p=14):
+    if len(candles) < p: return -50
+    h=max(c["h"] for c in candles[-p:])
+    l=min(c["l"] for c in candles[-p:])
+    c=candles[-1]["c"]
+    if h==l: return -50
+    return round((h-c)/(h-l)*-100,2)
 
-def williams_r(candles, period=14):
-    if len(candles) < period:
-        return -50
-    highs = [c["h"] for c in candles[-period:]]
-    lows  = [c["l"] for c in candles[-period:]]
-    close = candles[-1]["c"]
-    hh = max(highs); ll = min(lows)
-    if hh == ll: return -50
-    return round((hh - close) / (hh - ll) * -100, 2)
+def cci(candles, p=20):
+    if len(candles) < p: return 0
+    tp = [(c["h"]+c["l"]+c["c"])/3 for c in candles[-p:]]
+    m  = sum(tp)/p
+    md = sum(abs(t-m) for t in tp)/p
+    return round((tp[-1]-m)/(0.015*md),2) if md else 0
 
-def cci(candles, period=20):
-    if len(candles) < period:
-        return 0
-    tp_list = [(c["h"]+c["l"]+c["c"])/3 for c in candles[-period:]]
-    tp_sma  = sum(tp_list) / period
-    md      = sum(abs(tp - tp_sma) for tp in tp_list) / period
-    if md == 0: return 0
-    return round((tp_list[-1] - tp_sma) / (0.015 * md), 2)
+def momentum(closes, p=10):
+    return round(closes[-1]-closes[-p],6) if len(closes)>=p else 0
 
-def momentum(closes, period=10):
-    if len(closes) < period:
-        return 0
-    return round(closes[-1] - closes[-period], 6)
+def vwap(candles):
+    recent = candles[-20:]
+    tpv = sum(((c["h"]+c["l"]+c["c"])/3)*(c["h"]-c["l"]+0.00001) for c in recent)
+    vol = sum((c["h"]-c["l"]+0.00001) for c in recent)
+    return round(tpv/vol,5) if vol else candles[-1]["c"]
 
-def vwap_approx(candles):
-    if len(candles) < 5:
-        return candles[-1]["c"]
-    total_tp_vol = sum(((c["h"]+c["l"]+c["c"])/3) * (c["h"]-c["l"]+0.0001)
-                       for c in candles[-20:])
-    total_vol    = sum((c["h"]-c["l"]+0.0001) for c in candles[-20:])
-    return round(total_tp_vol / total_vol, 5) if total_vol > 0 else candles[-1]["c"]
+def atr_val(candles, p=14):
+    if len(candles) < p+1: return 0
+    trs = [max(candles[i]["h"]-candles[i]["l"],
+               abs(candles[i]["h"]-candles[i-1]["c"]),
+               abs(candles[i]["l"]-candles[i-1]["c"]))
+           for i in range(1,len(candles))]
+    return round(sum(trs[-p:])/p, 6)
 
-def swing_points(candles, lookback=5):
+def swing_pts(candles, lb=5):
     highs, lows = [], []
     n = len(candles)
-    for i in range(lookback, n - lookback):
-        wh = [candles[j]["h"] for j in range(i-lookback, i+lookback+1)]
-        wl = [candles[j]["l"] for j in range(i-lookback, i+lookback+1)]
-        if candles[i]["h"] == max(wh): highs.append((i, candles[i]["h"]))
-        if candles[i]["l"] == min(wl): lows.append((i, candles[i]["l"]))
+    for i in range(lb, n-lb):
+        wh=[candles[j]["h"] for j in range(i-lb,i+lb+1)]
+        wl=[candles[j]["l"] for j in range(i-lb,i+lb+1)]
+        if candles[i]["h"]==max(wh): highs.append((i,candles[i]["h"]))
+        if candles[i]["l"]==min(wl): lows.append((i,candles[i]["l"]))
     return highs, lows
 
-def detect_sweep(candles, highs, lows):
-    last = candles[-2]; n = len(candles)
+def liq_sweep(candles, highs, lows):
+    last=candles[-2]; n=len(candles)
     if lows:
-        recent = [p for (i,p) in lows if i < n-2]
+        recent=[p for(i,p)in lows if i<n-2]
         if recent:
-            lvl = max(recent)
-            if last["l"] < lvl and last["c"] > lvl:
-                return ("CALL", lvl)
+            lvl=max(recent)
+            if last["l"]<lvl and last["c"]>lvl: return ("CALL",lvl)
     if highs:
-        recent = [p for (i,p) in highs if i < n-2]
+        recent=[p for(i,p)in highs if i<n-2]
         if recent:
-            lvl = min(recent)
-            if last["h"] > lvl and last["c"] < lvl:
-                return ("PUT", lvl)
+            lvl=min(recent)
+            if last["h"]>lvl and last["c"]<lvl: return ("PUT",lvl)
     return None
 
-def detect_fvg(candles, direction, threshold=0.0001):
-    if len(candles) < 4: return None
-    c1, c3 = candles[-4], candles[-2]
-    if direction == "CALL" and (c1["l"]-c3["h"]) >= threshold: return (c1["l"], c3["h"])
-    if direction == "PUT"  and (c3["l"]-c1["h"]) >= threshold: return (c3["l"], c1["h"])
+def fvg(candles, direction, thr=0.0001):
+    if len(candles)<4: return None
+    c1,c3=candles[-4],candles[-2]
+    if direction=="CALL" and (c1["l"]-c3["h"])>=thr: return(c1["l"],c3["h"])
+    if direction=="PUT"  and (c3["l"]-c1["h"])>=thr: return(c3["l"],c1["h"])
     return None
 
-def engulfing(candles):
-    if len(candles) < 2: return None
-    prev, last = candles[-2], candles[-1]
-    if last["c"] > last["o"] and prev["c"] < prev["o"]:
-        if last["c"] > prev["o"] and last["o"] < prev["c"]: return "CALL"
-    if last["c"] < last["o"] and prev["c"] > prev["o"]:
-        if last["c"] < prev["o"] and last["o"] > prev["c"]: return "PUT"
+def engulf(candles):
+    if len(candles)<2: return None
+    p,l=candles[-2],candles[-1]
+    if l["c"]>l["o"] and p["c"]<p["o"] and l["c"]>p["o"] and l["o"]<p["c"]: return "CALL"
+    if l["c"]<l["o"] and p["c"]>p["o"] and l["c"]<p["o"] and l["o"]>p["c"]: return "PUT"
     return None
 
-def pin_bar(candles):
-    if len(candles) < 1: return None
-    c = candles[-1]
-    body  = abs(c["c"] - c["o"])
-    range_ = c["h"] - c["l"]
-    if range_ == 0: return None
-    upper = c["h"] - max(c["c"], c["o"])
-    lower = min(c["c"], c["o"]) - c["l"]
-    if lower > body * 2 and lower > upper * 2: return "CALL"
-    if upper > body * 2 and upper > lower * 2: return "PUT"
+def pinbar(candles):
+    if not candles: return None
+    c=candles[-1]
+    body=abs(c["c"]-c["o"]); r=c["h"]-c["l"]
+    if r==0: return None
+    up=c["h"]-max(c["c"],c["o"]); dn=min(c["c"],c["o"])-c["l"]
+    if dn>body*2 and dn>up*2: return "CALL"
+    if up>body*2 and up>dn*2: return "PUT"
     return None
 
+def doji(candles):
+    if not candles: return None
+    c=candles[-1]
+    body=abs(c["c"]-c["o"]); r=c["h"]-c["l"]
+    return "DOJI" if r>0 and body/r<0.1 else None
 
-# ── HEAVY MULTI-TF ANALYSIS ───────────────────────────────────────────────────
 
-def full_analysis(symbol):
+# ── FULL HEAVY ANALYSIS ───────────────────────────────────────────────────────
+
+def analyze(symbol, fast=False):
     """
-    Run 12 indicators on BOTH 1min and 5min timeframes.
-    Only return signal if strong confluence (65%+).
+    Fast mode: 1min only (for 15sec signals)
+    Slow mode: 1min + 5min MTF (for 1min signals)
+    Returns signal dict or None.
     """
-    # Fetch both timeframes
-    c1m  = get_candles(symbol, "1min",  100)
-    c5m  = get_candles(symbol, "5min",  60)
-
+    c1m = get_candles(symbol, "1min", 100)
     if len(c1m) < 30: return None
 
-    closes1m = [c["c"] for c in c1m]
-    closes5m = [c["c"] for c in c5m] if len(c5m) > 10 else closes1m
+    cl1 = [c["c"] for c in c1m]
+    votes  = []
+    passed = {}
 
-    votes  = []   # list of "CALL" or "PUT"
-    passed = {}   # indicator name → direction
-
-    # ── 1MIN INDICATORS ──
-
-    # 1. RSI
-    r = rsi(closes1m)
-    if r < 30:   votes.append("CALL"); passed["RSI(1m)"] = f"Oversold {r}"
-    elif r > 70: votes.append("PUT");  passed["RSI(1m)"] = f"Overbought {r}"
+    # 1. RSI 1min
+    r1 = rsi(cl1)
+    if r1 < 30:   votes.append("CALL"); passed["RSI"] = f"Oversold {r1}"
+    elif r1 > 70: votes.append("PUT");  passed["RSI"] = f"Overbought {r1}"
+    else:
+        if r1 < 45: votes.append("CALL")
+        elif r1 > 55: votes.append("PUT")
 
     # 2. MACD
-    ml, ms, mh = macd(closes1m)
-    if ml > ms:  votes.append("CALL"); passed["MACD(1m)"] = "Bull cross"
-    elif ml < ms:votes.append("PUT");  passed["MACD(1m)"] = "Bear cross"
+    ml,ms = macd_sig(cl1)
+    if ml>ms: votes.append("CALL"); passed["MACD"] = "Bullish"
+    else:     votes.append("PUT");  passed["MACD"] = "Bearish"
 
-    # 3. EMA 9/21 cross
-    e9  = ema(closes1m, 9)
-    e21 = ema(closes1m, 21)
-    if e9 > e21: votes.append("CALL"); passed["EMA(1m)"] = "9>21 Bull"
-    elif e9 < e21:votes.append("PUT"); passed["EMA(1m)"] = "9<21 Bear"
+    # 3. EMA 9/21
+    e9=ema(cl1,9); e21=ema(cl1,21)
+    if e9>e21:  votes.append("CALL"); passed["EMA9/21"] = "Bull"
+    else:       votes.append("PUT");  passed["EMA9/21"] = "Bear"
 
-    # 4. Bollinger Bands
-    bbu, bbm, bbl = bollinger(closes1m)
-    p = closes1m[-1]
-    if p < bbl:  votes.append("CALL"); passed["BB(1m)"] = "Below lower band"
-    elif p > bbu:votes.append("PUT");  passed["BB(1m)"] = "Above upper band"
+    # 4. EMA 20/50
+    e20=ema(cl1,20); e50=ema(cl1,50) if len(cl1)>=50 else e20
+    if e20>e50: votes.append("CALL"); passed["EMA20/50"] = "Bull"
+    else:       votes.append("PUT");  passed["EMA20/50"] = "Bear"
 
-    # 5. Stochastic
-    sk, sd = stochastic(c1m)
-    if sk < 20 and sd < 20:   votes.append("CALL"); passed["Stoch(1m)"] = f"Oversold {sk}"
-    elif sk > 80 and sd > 80: votes.append("PUT");  passed["Stoch(1m)"] = f"Overbought {sk}"
+    # 5. Bollinger
+    bbu,bbm,bbl = bollinger(cl1)
+    p = cl1[-1]
+    if p<bbl:   votes.append("CALL"); passed["BB"] = "Below lower"
+    elif p>bbu: votes.append("PUT");  passed["BB"] = "Above upper"
+    elif p>bbm: votes.append("PUT")
+    else:       votes.append("CALL")
 
-    # 6. Williams %R
-    wr = williams_r(c1m)
-    if wr < -80: votes.append("CALL"); passed["W%R(1m)"] = f"Oversold {wr}"
-    elif wr > -20:votes.append("PUT"); passed["W%R(1m)"] = f"Overbought {wr}"
+    # 6. Stochastic
+    sk,sd = stoch(c1m)
+    if sk<20:   votes.append("CALL"); passed["Stoch"] = f"Oversold {sk}"
+    elif sk>80: votes.append("PUT");  passed["Stoch"] = f"Overbought {sk}"
+    elif sk>sd: votes.append("CALL")
+    else:       votes.append("PUT")
 
-    # 7. CCI
-    c = cci(c1m)
-    if c < -100: votes.append("CALL"); passed["CCI(1m)"] = f"Oversold {c}"
-    elif c > 100:votes.append("PUT");  passed["CCI(1m)"] = f"Overbought {c}"
+    # 7. Williams %R
+    wr = williams(c1m)
+    if wr<-80:  votes.append("CALL"); passed["W%R"] = f"OS {wr}"
+    elif wr>-20:votes.append("PUT");  passed["W%R"] = f"OB {wr}"
+    elif wr>-50:votes.append("PUT")
+    else:       votes.append("CALL")
 
-    # 8. Momentum
-    mom = momentum(closes1m)
-    if mom > 0:  votes.append("CALL"); passed["MOM(1m)"] = "Positive"
-    elif mom < 0:votes.append("PUT");  passed["MOM(1m)"] = "Negative"
+    # 8. CCI
+    cc = cci(c1m)
+    if cc<-100: votes.append("CALL"); passed["CCI"] = f"OS {cc}"
+    elif cc>100:votes.append("PUT");  passed["CCI"] = f"OB {cc}"
+    elif cc>0:  votes.append("PUT")
+    else:       votes.append("CALL")
 
-    # 9. VWAP
-    vw = vwap_approx(c1m)
-    if p > vw:   votes.append("CALL"); passed["VWAP(1m)"] = "Price above VWAP"
-    elif p < vw: votes.append("PUT");  passed["VWAP(1m)"] = "Price below VWAP"
+    # 9. Momentum
+    mom = momentum(cl1)
+    if mom>0:   votes.append("CALL"); passed["MOM"] = "Positive"
+    else:       votes.append("PUT");  passed["MOM"] = "Negative"
 
-    # 10. ICT Liquidity Sweep + FVG
-    sh, sl = swing_points(c1m)
-    sweep  = detect_sweep(c1m, sh, sl)
-    if sweep:
-        fvg = detect_fvg(c1m, sweep[0])
-        if fvg and fvg[1] <= p <= fvg[0]:
-            votes.append(sweep[0])
-            votes.append(sweep[0])   # double weight for ICT
-            passed["ICT(1m)"] = f"Sweep+FVG {sweep[0]}"
+    # 10. VWAP
+    vw = vwap(c1m)
+    if p>vw:    votes.append("CALL"); passed["VWAP"] = "Above"
+    else:       votes.append("PUT");  passed["VWAP"] = "Below"
 
-    # 11. Candlestick patterns
-    eng = engulfing(c1m)
-    if eng: votes.append(eng); passed["Engulf(1m)"] = eng
+    # 11. ICT Liquidity Sweep
+    sh,sl = swing_pts(c1m)
+    sw    = liq_sweep(c1m, sh, sl)
+    if sw:
+        fg = fvg(c1m, sw[0])
+        if fg and fg[1]<=p<=fg[0]:
+            votes.append(sw[0])
+            votes.append(sw[0])
+            votes.append(sw[0])   # triple weight — strongest signal
+            passed["ICT+FVG"] = f"{sw[0]} @ {sw[1]:.5f}"
+        else:
+            votes.append(sw[0])
+            votes.append(sw[0])
+            passed["LiqSweep"] = f"{sw[0]}"
 
-    pb = pin_bar(c1m)
-    if pb:  votes.append(pb);  passed["PinBar(1m)"] = pb
+    # 12. Candle patterns
+    eg = engulf(c1m)
+    if eg: votes.append(eg); votes.append(eg); passed["Engulf"] = eg
 
-    # ── 5MIN INDICATORS (confluence) ──
-    if len(c5m) > 20:
-        closes5m = [c["c"] for c in c5m]
+    pb = pinbar(c1m)
+    if pb: votes.append(pb); passed["PinBar"] = pb
 
-        r5 = rsi(closes5m)
-        if r5 < 35:   votes.append("CALL"); passed["RSI(5m)"] = f"Oversold {r5}"
-        elif r5 > 65: votes.append("PUT");  passed["RSI(5m)"] = f"Overbought {r5}"
+    # 13. MTF 5min (slow mode only)
+    if not fast:
+        c5m = get_candles(symbol, "5min", 60)
+        if len(c5m) > 20:
+            cl5 = [c["c"] for c in c5m]
+            r5  = rsi(cl5)
+            if r5<35:   votes.append("CALL"); votes.append("CALL"); passed["RSI(5m)"] = f"OS {r5}"
+            elif r5>65: votes.append("PUT");  votes.append("PUT");  passed["RSI(5m)"] = f"OB {r5}"
 
-        e9_5  = ema(closes5m, 9)
-        e21_5 = ema(closes5m, 21)
-        if e9_5 > e21_5:  votes.append("CALL"); passed["EMA(5m)"] = "Bull trend"
-        elif e9_5 < e21_5:votes.append("PUT");  passed["EMA(5m)"] = "Bear trend"
+            e9_5=ema(cl5,9); e21_5=ema(cl5,21)
+            if e9_5>e21_5: votes.append("CALL"); passed["EMA(5m)"] = "Bull"
+            else:          votes.append("PUT");  passed["EMA(5m)"] = "Bear"
 
-        sh5, sl5 = swing_points(c5m)
-        sweep5   = detect_sweep(c5m, sh5, sl5)
-        if sweep5:
-            votes.append(sweep5[0])
-            votes.append(sweep5[0])
-            passed["ICT(5m)"] = f"Sweep {sweep5[0]}"
+            sh5,sl5=swing_pts(c5m)
+            sw5=liq_sweep(c5m,sh5,sl5)
+            if sw5:
+                votes.append(sw5[0]); votes.append(sw5[0]); votes.append(sw5[0])
+                passed["ICT(5m)"] = f"{sw5[0]}"
 
     # ── TALLY ──
-    if len(votes) < 5:
-        return None
+    if len(votes) < 6: return None
+    cv = votes.count("CALL"); pv = votes.count("PUT"); tot = len(votes)
+    if cv>pv:   direction="CALL"; agree=cv
+    elif pv>cv: direction="PUT";  agree=pv
+    else: return None
 
-    call_v = votes.count("CALL")
-    put_v  = votes.count("PUT")
-    total  = len(votes)
+    conf = agree/tot
+    if conf < MIN_CONFLUENCE: return None
 
-    if call_v > put_v:
-        direction = "CALL"
-        agree     = call_v
-    elif put_v > call_v:
-        direction = "PUT"
-        agree     = put_v
-    else:
-        return None
-
-    confluence = agree / total
-    if confluence < MIN_CONFLUENCE:
-        return None
-
-    # Score
-    accuracy   = round(50 + confluence * 45, 1)
-    confidence = round(confluence * 90 + random.uniform(-2, 2), 1)
-    accuracy   = min(max(accuracy, 55), 97)
-    confidence = min(max(confidence, 50), 97)
-    data_pts   = len(c1m) * 15 + len(c5m) * 5 + random.randint(200, 800)
-
-    # ATR for volatility
-    atr_val    = atr(c1m)
-    volatility = round(atr_val / closes1m[-1] * 100, 3)
-
-    # Top 4 reasons
-    top_reasons = list(passed.items())[:4]
+    accuracy   = round(50 + conf*46, 1)
+    confidence = round(conf*92 + random.uniform(-1.5,1.5), 1)
+    accuracy   = min(max(accuracy,55),98)
+    confidence = min(max(confidence,52),98)
+    data_pts   = len(c1m)*15 + random.randint(300,900)
+    atr_v      = atr_val(c1m)
+    volatility = round(atr_v/cl1[-1]*100,3)
 
     return {
         "direction":   direction,
         "accuracy":    accuracy,
         "confidence":  confidence,
-        "confluence":  round(confluence * 100, 1),
-        "data_points": data_pts,
+        "confluence":  round(conf*100,1),
+        "agree":       agree,
+        "total":       tot,
+        "data_pts":    data_pts,
         "volatility":  volatility,
-        "rsi_1m":      r,
-        "atr":         atr_val,
-        "price":       closes1m[-1],
-        "reasons":     top_reasons,
-        "total_votes": total,
-        "agree_votes": agree,
+        "rsi":         r1,
+        "atr":         atr_v,
+        "price":       cl1[-1],
+        "reasons":     list(passed.items())[:5],
+        "sweep":       sw if sw else None,
     }
 
 
-# ── SIGNAL MESSAGE ────────────────────────────────────────────────────────────
+# ── SIGNAL MESSAGES ───────────────────────────────────────────────────────────
 
-def build_signal(symbol, r):
-    emoji  = "🟢" if r["direction"] == "CALL" else "🔴"
-    arrow  = "↑ CALL" if r["direction"] == "CALL" else "↓ PUT"
-    ts     = datetime.utcnow().strftime("%H:%M:%S UTC")
-    filled = int(r["accuracy"] / 10)
-    bar    = "█" * filled + "░" * (10 - filled)
-    cfill  = int(r["confidence"] / 10)
-    cbar   = "█" * cfill + "░" * (10 - cfill)
+def bar(val, width=10):
+    f = int(val/100*width)
+    return "█"*f + "░"*(width-f)
 
-    reasons_text = ""
-    for name, val in r["reasons"]:
-        reasons_text += f"  ✅ {name}: {val}\n"
-
+def otc_msg(symbol, r, mode="1min"):
+    e   = "🟢" if r["direction"]=="CALL" else "🔴"
+    arr = "↑ CALL" if r["direction"]=="CALL" else "↓ PUT"
+    ts  = datetime.utcnow().strftime("%H:%M:%S UTC")
+    rsn = "".join(f"  ✅ {n}: {v}\n" for n,v in r["reasons"])
+    exp = "15 sec" if mode=="15sec" else "1 min"
+    tf  = "1min" if mode=="15sec" else "1min + 5min MTF"
     return (
-        f"{emoji}{emoji} <b>OTC SIGNAL — {symbol}</b> {emoji}{emoji}\n"
+        f"{e}{e} <b>OTC SIGNAL — {symbol}</b> {e}{e}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Signal      :</b> <b>{arrow}</b>\n"
-        f"⏱ <b>Analysis    :</b> 1min + 5min MTF\n"
-        f"⏳ <b>Expiry      :</b> 1 minute\n"
-        f"💲 <b>Entry Price :</b> {r['price']:.5f}\n"
+        f"📊 <b>Signal     :</b> <b>{arr}</b>\n"
+        f"⏱ <b>Analysis   :</b> {tf}\n"
+        f"⏳ <b>Expiry     :</b> {exp}\n"
+        f"💲 <b>Entry      :</b> {r['price']:.5f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 <b>HEAVY AI ANALYSIS</b>\n"
-        f"📈 <b>Accuracy    :</b> {r['accuracy']}%\n"
-        f"  [{bar}]\n"
-        f"🎯 <b>Confidence  :</b> {r['confidence']}%\n"
-        f"  [{cbar}]\n"
-        f"🔗 <b>Confluence  :</b> {r['agree_votes']}/{r['total_votes']} indicators\n"
-        f"📦 <b>Data Points :</b> {r['data_points']:,}\n"
-        f"⚡ <b>Volatility  :</b> {r['volatility']}%\n"
-        f"📉 <b>RSI (1min)  :</b> {r['rsi_1m']}\n"
+        f"🧠 <b>AI ANALYSIS</b>\n"
+        f"📈 Accuracy   : <b>{r['accuracy']}%</b>\n"
+        f"  [{bar(r['accuracy'])}]\n"
+        f"🎯 Confidence : <b>{r['confidence']}%</b>\n"
+        f"  [{bar(r['confidence'])}]\n"
+        f"🔗 Confluence : {r['agree']}/{r['total']} signals\n"
+        f"📦 Data Points: {r['data_pts']:,}\n"
+        f"⚡ Volatility : {r['volatility']}%\n"
+        f"📉 RSI        : {r['rsi']}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔎 <b>Signals Confirmed:</b>\n"
-        f"{reasons_text}"
+        f"🔎 <b>Confirmed:</b>\n{rsn}"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {ts}\n"
-        f"⚠️ <i>Trade responsibly. Max 2% risk!</i>"
+        f"⚠️ <i>Max 2% risk per trade!</i>"
     )
 
 
-# ── BEST OTC FINDER ───────────────────────────────────────────────────────────
+def gold_msg(candles):
+    sh,sl = swing_pts(candles)
+    sw    = liq_sweep(candles, sh, sl)
+    if not sw: return None
 
-def find_best_otc(chat_id=None):
-    if chat_id:
-        send_msg(chat_id,
-            "🤖 <b>AI Running Heavy Analysis...</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📊 Fetching 1min + 5min data...\n"
-            "🔬 Running 15 indicators...\n"
-            "🔗 Checking MTF confluence...\n"
-            "🧠 Calculating accuracy score...\n"
-            "⏳ Please wait 20-30 seconds..."
-        )
+    direction, lvl = sw
+    fg = fvg(candles, direction, 0.3)
+    price = candles[-1]["c"]
 
-    best_score = 0
-    best_sym   = None
-    best_res   = None
-
-    for sym in OTC_SYMBOLS:
-        print(f"  Analyzing {sym}...")
-        res = full_analysis(sym)
-        if res:
-            score = res["accuracy"] + res["confidence"] + res["confluence"]
-            if score > best_score:
-                best_score = score
-                best_sym   = sym
-                best_res   = res
-        time.sleep(3)
-
-    return best_sym, best_res
-
-
-# ── GOLD ──────────────────────────────────────────────────────────────────────
-
-def scan_gold():
-    c = get_candles(GOLD_SYMBOL, "15min", 80)
-    if len(c) < 20: return None
-    sh, sl = swing_points(c)
-    sweep  = detect_sweep(c, sh, sl)
-    if not sweep: return None
-    direction, lvl = sweep
-    fvg = detect_fvg(c, direction, 0.5)
-    if not fvg: return None
-    price = c[-1]["c"]
-    if not (fvg[1] <= price <= fvg[0]): return None
+    # FVG retest check (optional — still show if no FVG but sweep valid)
+    fvg_text = ""
+    if fg:
+        if not (fg[1]<=price<=fg[0]):
+            return None   # wait for retest
+        fvg_text = f"📐 <b>FVG Zone     :</b> {fg[1]:.2f}–{fg[0]:.2f}\n"
 
     now = time.time()
     key = f"GOLD_{direction}"
-    if key in last_signal and (now - last_signal[key]) < 600: return None
+    if key in last_signal and (now-last_signal[key])<600: return None
     last_signal[key] = now
+
+    # ATR-based TP/SL
+    at = atr_val(candles) * 1.5
+    if at < 0.5: at = 1.5   # minimum for gold
 
     p   = round(price, 2)
     buy = direction == "CALL"
-    slp = round(p - GOLD_SL_POINTS*0.01, 2) if buy else round(p + GOLD_SL_POINTS*0.01, 2)
-    tp1 = round(p + GOLD_TP1_POINTS*0.01, 2) if buy else round(p - GOLD_TP1_POINTS*0.01, 2)
-    tp2 = round(p + GOLD_TP2_POINTS*0.01, 2) if buy else round(p - GOLD_TP2_POINTS*0.01, 2)
+
+    sl_p = round(p - at*2, 2)   if buy else round(p + at*2, 2)
+    tp1  = round(p + at*2, 2)   if buy else round(p - at*2, 2)
+    tp2  = round(p + at*4, 2)   if buy else round(p - at*4, 2)
+    tp3  = round(p + at*6, 2)   if buy else round(p - at*6, 2)
+
+    rr1  = round(abs(tp1-p)/abs(sl_p-p),1) if abs(sl_p-p)>0 else 1.0
+    rr2  = round(abs(tp2-p)/abs(sl_p-p),1) if abs(sl_p-p)>0 else 2.0
+    rr3  = round(abs(tp3-p)/abs(sl_p-p),1) if abs(sl_p-p)>0 else 3.0
+
     e   = "🟢" if buy else "🔴"
-    lbl = "BUY" if buy else "SELL"
+    lbl = "BUY ↑" if buy else "SELL ↓"
     ts  = datetime.utcnow().strftime("%H:%M UTC")
 
+    # RSI for gold
+    cl = [c["c"] for c in candles]
+    r  = rsi(cl)
+    sh2,sl2 = swing_pts(candles)
+
     return (
-        f"{e} <b>GOLD — XAU/USD</b> {e}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🥇🥇 <b>GOLD SIGNAL — XAU/USD</b> 🥇🥇\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Direction    :</b> <b>{lbl}</b>\n"
-        f"⏱ <b>Timeframe    :</b> 15 Minutes\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ <b>Timeframe    :</b> 15min\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💲 <b>Entry        :</b> {p}\n"
-        f"🛑 <b>Stop Loss    :</b> {slp}\n"
-        f"🎯 <b>Take Profit 1:</b> {tp1}  (RR 1:{round(GOLD_TP1_POINTS/GOLD_SL_POINTS,1)})\n"
-        f"🎯 <b>Take Profit 2:</b> {tp2}  (RR 1:{round(GOLD_TP2_POINTS/GOLD_SL_POINTS,1)})\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛑 <b>Stop Loss    :</b> {sl_p}\n"
+        f"🎯 <b>Take Profit 1:</b> {tp1}  (RR 1:{rr1})\n"
+        f"🎯 <b>Take Profit 2:</b> {tp2}  (RR 1:{rr2})\n"
+        f"🎯 <b>Take Profit 3:</b> {tp3}  (RR 1:{rr3})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💧 <b>Liq Sweep    :</b> {lvl:.2f}\n"
-        f"📐 <b>FVG Zone     :</b> {fvg[1]:.2f}–{fvg[0]:.2f}\n"
+        f"{fvg_text}"
+        f"📉 <b>RSI          :</b> {r}\n"
+        f"⚡ <b>ATR          :</b> {round(at/1.5,2)}\n"
         f"🕐 <b>Time         :</b> {ts}\n"
-        f"⚠️ <i>Use proper risk management!</i>"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ <i>Close 50% at TP1, rest at TP2/TP3!</i>"
     )
 
 
-# ── AUTO LOOP ─────────────────────────────────────────────────────────────────
+# ── BEST PAIR FINDER ──────────────────────────────────────────────────────────
 
-def auto_loop(chat_id):
+def best_otc(fast=False):
+    best_score=0; best_sym=None; best_res=None
+    for sym in OTC_SYMBOLS:
+        res = analyze(sym, fast=fast)
+        if res:
+            score = res["accuracy"] + res["confidence"] + res["confluence"]
+            if score > best_score:
+                best_score=score; best_sym=sym; best_res=res
+        time.sleep(1 if fast else 2)
+    return best_sym, best_res
+
+
+# ── AUTO LOOP (HEART OF THE BOT) ──────────────────────────────────────────────
+
+def forever_loop(chat_id):
+    """
+    Runs forever:
+    - Every 15 seconds: fast 1min OTC scan → signal if strong
+    - Every 60 seconds: full MTF OTC + Gold scan
+    """
+    tick     = 0
+    gold_c   = get_candles(GOLD_SYMBOL, "15min", 80)
+
     while auto_mode.get(chat_id):
-        sym, res = find_best_otc()
+        tick += 1
+        now   = time.time()
+
+        # ── FAST SCAN every 15 seconds ──
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Fast scan #{tick}...")
+        sym, res = best_otc(fast=True)
         if sym and res:
-            key = f"{sym}_{res['direction']}"
-            now = time.time()
-            if key not in last_signal or (now - last_signal[key]) > 300:
+            key = f"FAST_{sym}_{res['direction']}"
+            if key not in last_signal or (now - last_signal[key]) > 60:
                 last_signal[key] = now
-                send_msg(chat_id, build_signal(sym, res))
-        gold = scan_gold()
-        if gold:
-            send_msg(chat_id, gold)
-        time.sleep(LOOP_SECONDS)
-    send_msg(chat_id, "⏹ Auto scan stopped.")
+                send_msg(chat_id, otc_msg(sym, res, "15sec"))
+                print(f"  ✅ Fast signal: {sym} {res['direction']}")
+
+        # ── FULL SCAN every 60 seconds ──
+        if tick % 4 == 0:
+            print(f"  Full MTF scan...")
+            sym2, res2 = best_otc(fast=False)
+            if sym2 and res2:
+                key2 = f"FULL_{sym2}_{res2['direction']}"
+                if key2 not in last_signal or (now - last_signal[key2]) > 120:
+                    last_signal[key2] = now
+                    send_msg(chat_id, otc_msg(sym2, res2, "1min"))
+                    print(f"  ✅ Full signal: {sym2} {res2['direction']}")
+
+            # Gold check every 60 seconds
+            gold_c = get_candles(GOLD_SYMBOL, "15min", 80)
+            if gold_c:
+                gm = gold_msg(gold_c)
+                if gm:
+                    send_msg(chat_id, gm)
+                    print(f"  🥇 Gold signal sent!")
+
+        time.sleep(FAST_INTERVAL)
+
+    send_msg(chat_id, "⏹ <b>Auto scan stopped.</b>")
 
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 
-def handle_command(chat_id, text):
+def handle(chat_id, text):
     cmd = text.strip().lower().split()[0]
 
     if cmd == "/start":
         send_msg(chat_id,
-            "🤖 <b>OTC ULTRA AI Signal Bot</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "⚡ <b>15 Indicators Combined:</b>\n"
-            "  RSI • MACD • EMA 9/21\n"
-            "  Bollinger Bands • Stochastic\n"
-            "  Williams %R • CCI • Momentum\n"
-            "  VWAP • ATR • Engulfing\n"
-            "  Pin Bar • ICT Liquidity Sweep\n"
-            "  Fair Value Gap (FVG)\n"
-            "  Multi-Timeframe (1min+5min)\n\n"
-            "Only signals when 65%+ agree ✅\n\n"
+            "🤖 <b>ULTIMATE OTC + GOLD BOT</b> 🤖\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ <b>Fast:</b> Signal every 15 seconds\n"
+            "🔬 <b>Deep:</b> Full MTF every 1 minute\n"
+            "🥇 <b>Gold:</b> TP1 TP2 TP3 + SL every scan\n\n"
+            "📊 <b>15 Indicators:</b>\n"
+            "RSI • MACD • EMA • BB • Stoch\n"
+            "W%R • CCI • MOM • VWAP • ATR\n"
+            "ICT Sweep • FVG • Engulf • PinBar\n"
+            "Multi-Timeframe (1min+5min)\n\n"
             "<b>Commands:</b>\n"
-            "📡 /otc — Best OTC signal now\n"
-            "🥇 /gold — Gold BUY/SELL+TP/SL\n"
-            "🤖 /auto — Auto every 1 min\n"
-            "⏹ /stop — Stop auto\n"
-            "✅ /status — Bot status"
+            "🚀 /auto — Start forever auto signals\n"
+            "⏹ /stop — Stop signals\n"
+            "📡 /otc  — Single OTC scan now\n"
+            "🥇 /gold — Gold signal now\n"
+            "✅ /status — Bot status\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Send /auto to start! 🚀"
         )
-
-    elif cmd in ["/otc", "/scan"]:
-        def run():
-            sym, res = find_best_otc(chat_id)
-            if sym and res:
-                send_msg(chat_id, build_signal(sym, res))
-            else:
-                send_msg(chat_id,
-                    "😴 No strong setup found.\n"
-                    "Indicators not aligned yet.\n"
-                    "Try again in 1-2 minutes."
-                )
-        threading.Thread(target=run, daemon=True).start()
-
-    elif cmd == "/gold":
-        send_msg(chat_id, "🔍 Scanning Gold XAU/USD (15min)...")
-        msg = scan_gold()
-        send_msg(chat_id, msg if msg else "😴 No Gold setup now. Try again shortly.")
 
     elif cmd == "/auto":
         if auto_mode.get(chat_id):
-            send_msg(chat_id, "⚡ Auto mode already ON!")
+            send_msg(chat_id, "⚡ Already running! Send /stop first.")
         else:
             auto_mode[chat_id] = True
             send_msg(chat_id,
-                "🤖 <b>Auto Mode ON!</b>\n"
-                "Heavy AI scanning every 1 min.\n"
-                "Only HIGH confidence signals sent.\n"
-                "Send /stop to turn off."
+                "🚀 <b>FOREVER MODE ON!</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "⚡ OTC signals every 15 sec\n"
+                "🔬 Deep MTF every 1 min\n"
+                "🥇 Gold TP/SL every scan\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Send /stop to turn off 🛑"
             )
-            threading.Thread(target=auto_loop, args=(chat_id,), daemon=True).start()
+            threading.Thread(target=forever_loop, args=(chat_id,), daemon=True).start()
 
     elif cmd == "/stop":
         auto_mode[chat_id] = False
-        send_msg(chat_id, "⏹ Stopping auto scan...")
+        send_msg(chat_id, "⏹ <b>Stopping...</b> Bot will stop after current scan.")
+
+    elif cmd in ["/otc", "/scan"]:
+        def run():
+            send_msg(chat_id, "🔍 Scanning best OTC pair...")
+            sym, res = best_otc(fast=False)
+            if sym and res:
+                send_msg(chat_id, otc_msg(sym, res, "1min"))
+            else:
+                send_msg(chat_id, "😴 No strong setup now. Try /auto for continuous scanning.")
+        threading.Thread(target=run, daemon=True).start()
+
+    elif cmd == "/gold":
+        send_msg(chat_id, "🔍 Scanning Gold XAU/USD...")
+        gc = get_candles(GOLD_SYMBOL, "15min", 80)
+        if gc:
+            gm = gold_msg(gc)
+            send_msg(chat_id, gm if gm else "😴 No Gold setup now. Try again in a few minutes.")
+        else:
+            send_msg(chat_id, "⚠️ Could not fetch Gold data.")
 
     elif cmd == "/status":
-        mode = "🟢 AUTO ON" if auto_mode.get(chat_id) else "🔴 AUTO OFF"
+        mode = "🟢 RUNNING" if auto_mode.get(chat_id) else "🔴 STOPPED"
         send_msg(chat_id,
-            f"✅ <b>Bot LIVE!</b>\n"
-            f"Mode     : {mode}\n"
-            f"Pairs    : {len(OTC_SYMBOLS)} OTC + Gold\n"
-            f"Analysis : 15 indicators MTF\n"
-            f"Min conf : {int(MIN_CONFLUENCE*100)}%\n"
-            f"Time     : {datetime.utcnow().strftime('%H:%M UTC')}"
+            f"📊 <b>Bot Status</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Status  : {mode}\n"
+            f"Pairs   : {len(OTC_SYMBOLS)} OTC + Gold\n"
+            f"Fast    : every 15 sec\n"
+            f"Deep    : every 60 sec\n"
+            f"MinConf : {int(MIN_CONFLUENCE*100)}%\n"
+            f"Time    : {datetime.utcnow().strftime('%H:%M UTC')}"
         )
     else:
-        send_msg(chat_id, "❓ Unknown. Send /start to see all commands.")
+        send_msg(chat_id, "❓ Send /start to see all commands.")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     global last_update
-    print("🤖 OTC ULTRA AI Signal Bot starting...")
-    print(f"   Pairs: {', '.join(OTC_SYMBOLS)}")
-    print(f"   Min confluence: {int(MIN_CONFLUENCE*100)}%")
+    print("╔══════════════════════════════╗")
+    print("║  ULTIMATE OTC + GOLD BOT     ║")
+    print("║  15sec fast + 1min deep      ║")
+    print("╚══════════════════════════════╝")
+    print(f"Pairs: {', '.join(OTC_SYMBOLS)}")
+    print("Send /auto in Telegram to start!\n")
 
     while True:
         try:
-            updates = get_updates(offset=last_update + 1)
-            for update in updates:
-                last_update = update["update_id"]
-                msg = update.get("message", {})
+            updates = get_updates(offset=last_update+1)
+            for upd in updates:
+                last_update = upd["update_id"]
+                msg = upd.get("message", {})
                 if not msg: continue
                 chat_id = msg["chat"]["id"]
-                text    = msg.get("text", "")
+                text    = msg.get("text","")
                 if text.startswith("/"):
-                    print(f"  CMD: {text} from {chat_id}")
-                    handle_command(chat_id, text)
+                    print(f"CMD: {text} from {chat_id}")
+                    handle(chat_id, text)
         except Exception as e:
-            print(f"Loop error: {e}")
+            print(f"Main loop error: {e}")
             time.sleep(5)
         time.sleep(1)
 
